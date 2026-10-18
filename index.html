@@ -44,6 +44,17 @@ const $=s=>document.querySelector(s);
 const DB_KEY='untitled_drive_music_db_v1';
 let db=JSON.parse(localStorage.getItem(DB_KEY)||'null')||{playlists:[],albums:[],folderPlaylists:[],tracks:[],settings:{clientId:''}};
 let currentView='home',currentTrackIndex=-1,queue=[],shuffle=false,tokenClient=null,accessToken=null,tokenExpiry=0;
+// Keep a short-lived Google access token in this tab's session only, so a GitHub Pages
+// deployment/reload does not immediately force another sign-in. Never cache tokens in the SW.
+try {
+  const savedAuth = JSON.parse(sessionStorage.getItem('unreleasedwav_google_session') || 'null');
+  if (savedAuth && savedAuth.accessToken && savedAuth.expiresAt > Date.now() + 30000) {
+    accessToken = savedAuth.accessToken;
+    tokenExpiry = savedAuth.expiresAt;
+  } else {
+    sessionStorage.removeItem('unreleasedwav_google_session');
+  }
+} catch (e) { console.warn('Could not restore this tab session', e); }
 let cloudDbFileId=null, cloudSyncBusy=false, cloudSyncTimer=null;
 const CLOUD_DB_NAME='unreleasedwav-library.json';
 async function findCloudDb(){
@@ -95,7 +106,13 @@ $('#nav').addEventListener('click',e=>{let b=e.target.closest('button[data-view]
 let deferredInstallPrompt=null;
 window.addEventListener('beforeinstallprompt',e=>{e.preventDefault();deferredInstallPrompt=e;});
 async function installPwa(){if(deferredInstallPrompt){deferredInstallPrompt.prompt();await deferredInstallPrompt.userChoice;deferredInstallPrompt=null;return}alert('On iPhone: open this app in Safari, tap Share, then “Add to Home Screen”. On desktop, use the browser install icon or menu. HTTPS hosting is required.');}
-if('serviceWorker' in navigator && location.protocol.startsWith('http'))window.addEventListener('load',()=>navigator.serviceWorker.register('./sw.js').catch(e=>console.warn('PWA offline setup failed',e)));
+if('serviceWorker' in navigator && location.protocol.startsWith('http'))window.addEventListener('load',async()=>{
+  try {
+    const registration = await navigator.serviceWorker.register('./sw.js', { updateViaCache: 'none' });
+    // Check for a new deployment without clearing localStorage/sessionStorage or the app shell cache.
+    registration.update().catch(()=>{});
+  } catch(e) { console.warn('PWA offline setup failed',e); }
+});
 function fileToDataUrl(file){return new Promise((resolve,reject)=>{const r=new FileReader();r.onload=()=>resolve(r.result);r.onerror=reject;r.readAsDataURL(file)})}
 function setCoverPreview(inputId,previewId){const file=document.getElementById(inputId)?.files?.[0];if(!file)return;if(!file.type.startsWith('image/')){alert('Choose an image file.');return}if(file.size>2*1024*1024){alert('Please use cover art under 2 MB.');return}fileToDataUrl(file).then(src=>{const p=document.getElementById(previewId);p.src=src;p.dataset.newCover=src})}
 function saveCollectionDetails(kind,id){const arr=kind==='album'?db.albums:kind==='folder'?db.folderPlaylists:db.playlists;const x=arr.find(v=>v.id===id);if(!x)return;x.name=document.getElementById('editName').value.trim()||x.name;x.description=document.getElementById('editDescription').value.trim();x.artist=document.getElementById('editArtist').value.trim();x.year=document.getElementById('editYear').value.trim();const cover=document.getElementById('coverPreview').dataset.newCover;if(cover)x.cover=cover;scheduleCloudSync();closeModal();render()}
@@ -115,8 +132,33 @@ function openModal(html){$('#modalRoot').innerHTML=`<div class="modal-backdrop" 
 function closeModal(){$('#modalRoot').innerHTML=''}
 function openSettings(){openModal(`<h2>Connect your Google Drive</h2><p class="muted">This app uses Google OAuth and the Drive API. Your music files stay in Drive; playlists, albums, and folder-playlist metadata are synchronized through a private JSON library stored in your Google Drive app data, available when you sign in on another device.</p><div class="notice">Setup required: create a Google Cloud project, enable Google Drive API, configure OAuth for a Web application, and add this app's origin to Authorized JavaScript origins.</div><div class="field"><label>Google OAuth Client ID</label><input id="clientId" placeholder="123456789-….apps.googleusercontent.com" value="${escapeHtml(db.settings.clientId||'')}"></div><div class="field"><label>Import options</label><p class="muted">Audio files are listed from Drive. To play a selected file, the app requests temporary read access.</p></div><div class="modal-actions"><button class="ghost" onclick="closeModal()">Cancel</button><button class="primary" onclick="saveClientId()">Save & connect</button></div>`)}
 function saveClientId(){let id=$('#clientId').value.trim();if(!id){alert('Enter your Google OAuth Client ID first.');return}db.settings.clientId=id;save();closeModal();connectGoogle()}
-function connectGoogle(){if(!db.settings.clientId){openSettings();return}if(!window.google?.accounts?.oauth2){let s=document.createElement('script');s.src='https://accounts.google.com/gsi/client';s.onload=connectGoogle;s.onerror=()=>alert('Could not load Google sign-in. Check your connection.');document.head.appendChild(s);return}tokenClient=google.accounts.oauth2.initTokenClient({client_id:db.settings.clientId,scope:'https://www.googleapis.com/auth/drive.readonly https://www.googleapis.com/auth/drive.file https://www.googleapis.com/auth/drive.appdata',callback:async r=>{if(r.error){alert('Google authorization failed: '+r.error);return}accessToken=r.access_token;tokenExpiry=Date.now()+(r.expires_in||3600)*1000;$('#driveStatus').textContent='Connected · syncing';(async()=>{try{await loadCloudDb()}catch(e){console.warn('Cloud library load failed',e)}await importDriveFiles();await saveCloudDb();render()})()}});tokenClient.requestAccessToken({prompt:accessToken?'':'consent'})}
-async function driveFetch(url,opts={}){if(!accessToken||Date.now()>tokenExpiry-30000)throw Error('Drive session expired. Connect again.');let r=await fetch(url,{...opts,headers:{Authorization:'Bearer '+accessToken,...(opts.headers||{})}});if(!r.ok)throw Error('Google Drive error '+r.status);return r}
+function persistGoogleSession(){
+  try {
+    if(accessToken && tokenExpiry > Date.now() + 30000) sessionStorage.setItem('unreleasedwav_google_session', JSON.stringify({accessToken, expiresAt:tokenExpiry}));
+    else sessionStorage.removeItem('unreleasedwav_google_session');
+  } catch(e) { console.warn('Could not save temporary Google session', e); }
+}
+async function finishGoogleConnect(){
+  $('#driveStatus').textContent='Connected · syncing';
+  try { await loadCloudDb(); } catch(e) { console.warn('Cloud library load failed', e); }
+  await importDriveFiles(); await saveCloudDb(); render();
+}
+function connectGoogle(){
+  if(!db.settings.clientId){openSettings();return}
+  if(!window.google?.accounts?.oauth2){let s=document.createElement('script');s.src='https://accounts.google.com/gsi/client';s.onload=connectGoogle;s.onerror=()=>alert('Could not load Google sign-in. Check your connection.');document.head.appendChild(s);return}
+  tokenClient=google.accounts.oauth2.initTokenClient({client_id:db.settings.clientId,scope:'https://www.googleapis.com/auth/drive.readonly https://www.googleapis.com/auth/drive.file https://www.googleapis.com/auth/drive.appdata',callback:async r=>{
+    if(r.error){console.warn('Google authorization failed',r);$('#driveStatus').textContent='Reconnect Google Drive';return}
+    accessToken=r.access_token;tokenExpiry=Date.now()+(r.expires_in||3600)*1000;persistGoogleSession();await finishGoogleConnect();
+  }});
+  // Do not force the consent screen on every deployment. Google may still require a user gesture/account chooser.
+  tokenClient.requestAccessToken({prompt:''});
+}
+async function driveFetch(url,opts={}){
+  if(!accessToken||Date.now()>tokenExpiry-30000){accessToken=null;tokenExpiry=0;persistGoogleSession();$('#driveStatus').textContent='Reconnect Google Drive';throw Error('Google session expired. Select Connect Drive to continue.')}
+  let r=await fetch(url,{...opts,headers:{Authorization:'Bearer '+accessToken,...(opts.headers||{})}});
+  if(r.status===401){accessToken=null;tokenExpiry=0;persistGoogleSession();$('#driveStatus').textContent='Reconnect Google Drive';throw Error('Google session expired. Select Connect Drive to continue.')}
+  if(!r.ok)throw Error('Google Drive error '+r.status);return r
+}
 async function importDriveFiles(){try{let q=encodeURIComponent("trashed = false and mimeType contains 'audio/'");let r=await driveFetch('https://www.googleapis.com/drive/v3/files?q='+q+'&pageSize=1000&orderBy=name&fields=files(id,name,mimeType,modifiedTime,webViewLink,parents,size,description)');let data=await r.json();let old=new Map(db.tracks.map(t=>[t.id,t]));db.tracks=data.files.map(f=>({...old.get(f.id),id:f.id,name:f.name.replace(/\.[^.]+$/,''),fileName:f.name,mimeType:f.mimeType,size:Number(f.size||0),modifiedTime:f.modifiedTime,description:f.description||'',source:'Google Drive',webViewLink:f.webViewLink,parents:f.parents||[]}));save();$('#driveStatus').textContent='Connected · '+db.tracks.length+' tracks';render();await saveCloudDb();}catch(e){alert('Could not import files: '+e.message);$('#driveStatus').textContent='Connection issue'}}
 function openCreate(kind){let title=kind==='playlist'?'Create playlist':kind==='folder'?'Pack a Drive folder':'Create album';let extra='';if(kind==='album')extra=`<div class="field"><label>Build album from</label><select id="albumSource" onchange="toggleAlbumSource(this.value)"><option value="playlist">Regular playlist</option><option value="folder">Folder playlist</option></select></div><div class="field"><label>Source collection</label><select id="sourceId">${db.playlists.map(x=>`<option value="${x.id}">${escapeHtml(x.name)}</option>`).join('')||'<option value="">No playlists yet</option>'}</select><div id="sourceHelp" class="track-meta">The album starts with the playlist tracks. You can edit it later.</div></div>`;if(kind==='folder')extra=`<div class="field"><label>Drive folder</label><select id="folderId"><option value="">Choose a folder from Drive…</option></select><div class="track-meta">Connect Drive first, then choose a folder. This makes a syncable folder playlist.</div></div>`;openModal(`<h2>${title}</h2><div class="field"><label>Name</label><input id="collectionName" placeholder="${kind==='album'?'e.g. Blue hour':kind==='folder'?'e.g. Late night folder':'e.g. On repeat'}"></div><div class="field"><label>Description (optional)</label><input id="collectionDesc" placeholder="A little note about this collection"></div>${extra}<div class="modal-actions"><button class="ghost" onclick="closeModal()">Cancel</button><button class="primary" onclick="createCollection('${kind}')">Create</button></div>`);if(kind==='album')toggleAlbumSource('playlist');if(kind==='folder')loadFolders()}
 function toggleAlbumSource(type){let s=$('#sourceId');if(!s)return;let arr=type==='folder'?db.folderPlaylists:db.playlists;s.innerHTML=arr.map(x=>`<option value="${x.id}">${escapeHtml(x.name)}</option>`).join('')||'<option value="">No collections yet</option>';$('#sourceHelp').textContent=type==='folder'?'The album will be based on the selected folder playlist.':'The album will be based on the selected regular playlist.'}
@@ -131,31 +173,41 @@ function deleteCollection(kind,id){if(!confirm('Delete this collection? Your Dri
 async function syncFolder(id){let x=db.folderPlaylists.find(v=>v.id===id);try{let q=encodeURIComponent(`'${x.folderId}' in parents and trashed=false and mimeType contains 'audio/'`);let r=await driveFetch('https://www.googleapis.com/drive/v3/files?q='+q+'&pageSize=1000&fields=files(id,name,mimeType,modifiedTime,webViewLink,parents)');let d=await r.json();for(let f of d.files){if(!db.tracks.some(t=>t.id===f.id))db.tracks.push({id:f.id,name:f.name.replace(/\.[^.]+$/,''),fileName:f.name,mimeType:f.mimeType,source:'Google Drive',parents:f.parents||[],webViewLink:f.webViewLink})}x.trackIds=db.tracks.filter(t=>(t.parents||[]).includes(x.folderId)).map(t=>t.id);scheduleCloudSync();alert('Folder playlist synced.');openCollection('folder',id)}catch(e){alert('Sync failed: '+e.message)}}
 function playCollection(kind,id){let arr=kind==='album'?db.albums:kind==='folder'?db.folderPlaylists:db.playlists;let x=arr.find(v=>v.id===id);queue=x.trackIds.map(id=>db.tracks.find(t=>t.id===id)).filter(Boolean);if(queue.length)playTrack(queue[0].id)}
 function playTrack(id){let all=queue.length?queue:db.tracks;let i=all.findIndex(t=>t.id===id);if(i<0){queue=db.tracks;all=queue;i=all.findIndex(t=>t.id===id)}if(i<0)return;currentTrackIndex=i;let t=all[i];loadAndPlay(t)}
+function updateMediaSession(t){if(!('mediaSession' in navigator))return;try{const artwork=t?.cover?[{src:t.cover,sizes:'512x512',type:'image/png'}]:[{src:'icon-192.png',sizes:'192x192',type:'image/png'},{src:'icon-512.png',sizes:'512x512',type:'image/png'}];navigator.mediaSession.metadata=new MediaMetadata({title:t?.title||t?.name||'UnReleased.wav',artist:t?.artist||'UnReleased.wav',album:t?.album||'Your Drive collection',artwork});}catch(e){console.warn('Media metadata unavailable',e)}}
+function updateMediaPosition(){if(!('mediaSession' in navigator)||!Number.isFinite(audio.duration)||audio.duration<=0)return;try{navigator.mediaSession.setPositionState({duration:audio.duration,playbackRate:audio.playbackRate||1,position:Math.min(audio.currentTime,audio.duration)})}catch(e){}}
+function setMediaPlaybackState(state){if('mediaSession' in navigator){try{navigator.mediaSession.playbackState=state}catch(e){}}}
 async function loadAndPlay(t){
  try{
   if(!accessToken){alert('Connect Google Drive to play your music.');openSettings();return}
-  $('#nowTitle').textContent=t.title||t.name;$('#nowArtist').textContent=[t.artist,t.album].filter(Boolean).join(' · ')||'Google Drive';$('#miniCover').innerHTML=t.cover?`<img src="${t.cover}" style="width:100%;height:100%;object-fit:cover;border-radius:9px">`:'♪';$('#playBtn').textContent='…';
+  $('#nowTitle').textContent=t.title||t.name;$('#nowArtist').textContent=[t.artist,t.album].filter(Boolean).join(' · ')||'Google Drive';$('#miniCover').innerHTML=t.cover?`<img src="${t.cover}" style="width:100%;height:100%;object-fit:cover;border-radius:9px">`:'♪';$('#playBtn').textContent='…';updateMediaSession(t);setMediaPlaybackState('none');
   if(audio.dataset.objectUrl){URL.revokeObjectURL(audio.dataset.objectUrl);delete audio.dataset.objectUrl}audio.pause();audio.removeAttribute('src');audio.load();
   const mime=t.mimeType||'audio/mpeg';
   if(window.MediaSource&&t.size&&MediaSource.isTypeSupported(mime)){
    const ms=new MediaSource();const url=URL.createObjectURL(ms);audio.dataset.objectUrl=url;audio.src=url;
    await new Promise((resolve,reject)=>{ms.addEventListener('sourceopen',()=>{try{const sb=ms.addSourceBuffer(mime);let offset=0,busy=false,done=false,firstChunkReady=false;const chunk=4*1024*1024;const pump=async()=>{if(busy||done||sb.updating)return;busy=true;try{if(offset>=Number(t.size)){done=true;if(ms.readyState==='open')ms.endOfStream();resolve();return}const end=Math.min(Number(t.size)-1,offset+chunk-1);const r=await driveFetch(`https://www.googleapis.com/drive/v3/files/${encodeURIComponent(t.id)}?alt=media`,{headers:{Range:`bytes=${offset}-${end}`}});const b=await r.arrayBuffer();if(!b.byteLength)throw Error('Drive returned an empty audio chunk');offset+=b.byteLength;sb.appendBuffer(b)}catch(e){done=true;try{if(ms.readyState==='open')ms.endOfStream('network')}catch{}reject(e)}finally{busy=false}};sb.addEventListener('updateend',()=>{if(!firstChunkReady){firstChunkReady=true;resolve()}if(offset>=Number(t.size)){if(!done){done=true;if(ms.readyState==='open')ms.endOfStream()}}else pump()});pump()}catch(e){reject(e)}},{once:true})});
   }else{const r=await driveFetch(`https://www.googleapis.com/drive/v3/files/${encodeURIComponent(t.id)}?alt=media`);const blob=await r.blob();const url=URL.createObjectURL(blob);audio.dataset.objectUrl=url;audio.src=url}
-  await audio.play();$('#playBtn').textContent='Ⅱ';
+  await audio.play();$('#playBtn').textContent='Ⅱ';setMediaPlaybackState('playing');
  }catch(e){console.error('Playback failed',e);$('#playBtn').textContent='▶';const msg=e.name==='NotAllowedError'?'The browser blocked playback. Press Play to try again.':e.message||'Unknown playback error';alert('Could not play this track. '+msg+' Reconnect Google Drive if needed.')}
 }
-function togglePlay(){if(!audio.src){if(db.tracks[0])playTrack(db.tracks[0].id);return}if(audio.paused){audio.play();$('#playBtn').textContent='Ⅱ'}else{audio.pause();$('#playBtn').textContent='▶'}}
+function togglePlay(){if(!audio.src){if(db.tracks[0])playTrack(db.tracks[0].id);return}if(audio.paused){audio.play().then(()=>setMediaPlaybackState('playing')).catch(e=>console.warn(e));$('#playBtn').textContent='Ⅱ'}else{audio.pause();$('#playBtn').textContent='▶';setMediaPlaybackState('paused')}}
 function nextTrack(){if(!queue.length)queue=db.tracks;if(!queue.length)return;currentTrackIndex=(currentTrackIndex+1)%queue.length;loadAndPlay(queue[currentTrackIndex])}
-function prevTrack(){if(!queue.length)queue=db.tracks;if(!queue.length)return;currentTrackIndex=(currentTrackIndex-1+queue.length)%queue.length;loadAndPlay(queue[currentTrackIndex])}
+function prevTrack(){if(!queue.length)queue=db.tracks;if(!queue.length)return;if(audio.src&&audio.currentTime>3){audio.currentTime=0;audio.play().then(()=>setMediaPlaybackState('playing')).catch(e=>console.warn(e));return}currentTrackIndex=(currentTrackIndex-1+queue.length)%queue.length;loadAndPlay(queue[currentTrackIndex])}
 function toggleShuffle(){shuffle=!shuffle;if(shuffle&&queue.length)queue.sort(()=>Math.random()-.5)}
 function seekAudio(v){if(audio.duration)audio.currentTime=audio.duration*Number(v)/100}
-audio.addEventListener('timeupdate',()=>{$('#elapsed').textContent=duration(audio.currentTime);$('#duration').textContent=duration(audio.duration);$('#seek').value=audio.duration?audio.currentTime/audio.duration*100:0});
+audio.addEventListener('timeupdate',()=>{$('#elapsed').textContent=duration(audio.currentTime);$('#duration').textContent=duration(audio.duration);$('#seek').value=audio.duration?audio.currentTime/audio.duration*100:0;updateMediaPosition()});
+audio.addEventListener('loadedmetadata',updateMediaPosition);audio.addEventListener('durationchange',updateMediaPosition);audio.addEventListener('play',()=>{setMediaPlaybackState('playing');$('#playBtn').textContent='Ⅱ'});audio.addEventListener('pause',()=>{setMediaPlaybackState('paused');$('#playBtn').textContent='▶'});
 audio.addEventListener('ended',nextTrack);audio.addEventListener('error',()=>{if(audio.src)$('#playBtn').textContent='▶'});
+if('mediaSession' in navigator){const bindMediaAction=(action,handler)=>{try{navigator.mediaSession.setActionHandler(action,handler)}catch(e){}};bindMediaAction('play',()=>{if(audio.src)audio.play().catch(e=>console.warn(e));else if(db.tracks[0])playTrack(db.tracks[0].id)});bindMediaAction('pause',()=>audio.pause());bindMediaAction('previoustrack',prevTrack);bindMediaAction('nexttrack',nextTrack);bindMediaAction('seekto',details=>{if(Number.isFinite(details.seekTime))audio.currentTime=details.seekTime});bindMediaAction('seekbackward',details=>{audio.currentTime=Math.max(0,audio.currentTime-(details.seekOffset||10))});bindMediaAction('seekforward',details=>{audio.currentTime=Math.min(audio.duration||Infinity,audio.currentTime+(details.seekOffset||10))})}
 function editTrackMetadata(id){const t=db.tracks.find(x=>x.id===id);if(!t)return;openModal(`<h2>Edit track metadata</h2><div class="field"><label>Track title</label><input id="metaTitle" value="${escapeHtml(t.title||t.name)}"></div><div class="field"><label>Artist</label><input id="metaArtist" value="${escapeHtml(t.artist||'')}"></div><div class="field"><label>Album</label><input id="metaAlbum" value="${escapeHtml(t.album||'')}"></div><div class="field"><label>Track number</label><input id="metaTrackNo" type="number" min="1" value="${escapeHtml(t.trackNumber||'')}"></div><div class="field"><label>Year</label><input id="metaYear" type="number" min="1900" max="2100" value="${escapeHtml(t.year||'')}"></div><div class="modal-actions"><button class="ghost" onclick="closeModal()">Cancel</button><button class="primary" onclick="saveTrackMetadata('${id}')">Save metadata</button></div>`)}function saveTrackMetadata(id){const t=db.tracks.find(x=>x.id===id);if(!t)return;t.title=$('#metaTitle').value.trim()||t.name;t.name=t.title;t.artist=$('#metaArtist').value.trim();t.album=$('#metaAlbum').value.trim();t.trackNumber=$('#metaTrackNo').value;t.year=$('#metaYear').value;scheduleCloudSync();closeModal();render()}
 function addTrackToPlaylist(id){if(!db.playlists.length){openCreate('playlist');return}openModal(`<h2>Add to playlist</h2><p class="muted">Choose where this track belongs.</p>${db.playlists.map(p=>`<button style="display:block;width:100%;text-align:left;margin:8px 0" onclick="addTo('${p.id}','${id}')">${escapeHtml(p.name)}</button>`).join('')}<div class="modal-actions"><button onclick="closeModal()">Cancel</button></div>`)}
 function addTo(pid,tid){let p=db.playlists.find(x=>x.id===pid);if(p&&!p.trackIds.includes(tid))p.trackIds.push(tid);scheduleCloudSync();closeModal()}
 async function manualSync(){if(!accessToken){openSettings();return}$('#driveStatus').textContent='Syncing…';try{await saveCloudDb();await loadCloudDb();await importDriveFiles();await saveCloudDb();render();alert('Library sync complete.')}catch(e){$('#driveStatus').textContent='Sync issue';alert('Sync failed: '+e.message)}}
 function addDemoHint(){alert('To import: click Settings → enter your Google OAuth Client ID → sign in → allow Drive access. Audio files are discovered automatically. Collection metadata is stored in Google Drive app data for cross-device sync.')}
 render();
+// Resume a still-valid temporary token after an in-tab reload/deployment.
+if(accessToken && tokenExpiry > Date.now() + 30000 && db.settings.clientId){
+  $('#driveStatus').textContent='Restoring session…';
+  finishGoogleConnect().catch(e=>{console.warn('Could not restore Drive session',e);$('#driveStatus').textContent='Reconnect Google Drive';});
+}
 </script>
 </body></html>
