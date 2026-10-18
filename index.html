@@ -164,17 +164,36 @@ function fileExtension(name=''){const m=String(name).toLowerCase().match(/\.([a-
 function isAudioCandidate(f){const ext=fileExtension(f.name);return (f.mimeType||'').toLowerCase().startsWith('audio/')||AUDIO_EXTENSIONS.has(ext)}
 function normalizedAudioMime(f){const ext=fileExtension(f.name);if(ext==='mp3')return 'audio/mpeg';if(ext==='wav'||ext==='wave')return 'audio/wav';if(ext==='m4a')return 'audio/mp4';if(ext==='aac')return 'audio/aac';if(ext==='ogg'||ext==='oga')return 'audio/ogg';if(ext==='opus')return 'audio/opus';if(ext==='flac')return 'audio/flac';return (f.mimeType||'').toLowerCase().startsWith('audio/')?f.mimeType:'application/octet-stream'}
 async function listDriveFiles(query="trashed=false", extra=''){
- let all=[],pageToken='';
+ // Use Drive's user corpus for a complete My Drive scan. allDrives can return
+ // incompleteSearch=true on large drives and silently omit files.
+ let all=[],pageToken='',page=0,incomplete=false;
  do{
-  const fields='nextPageToken,incompleteSearch,files(id,name,mimeType,modifiedTime,webViewLink,parents,size,description,shortcutDetails)';
-  let url='https://www.googleapis.com/drive/v3/files?q='+encodeURIComponent(query)+'&pageSize=1000&orderBy=name&fields='+encodeURIComponent(fields)+'&supportsAllDrives=true&includeItemsFromAllDrives=true&corpora=allDrives'+(extra?'&'+extra:'')+(pageToken?'&pageToken='+encodeURIComponent(pageToken):'');
-  const r=await driveFetch(url);const d=await r.json();all.push(...(d.files||[]));pageToken=d.nextPageToken||'';
+  const fields='nextPageToken,incompleteSearch,files(id,name,mimeType,modifiedTime,webViewLink,parents,size,description,shortcutDetails,driveId)';
+  let url='https://www.googleapis.com/drive/v3/files?q='+encodeURIComponent(query)+'&pageSize=1000&orderBy=name&fields='+encodeURIComponent(fields)+'&supportsAllDrives=true&includeItemsFromAllDrives=true&corpora=user'+(extra?'&'+extra:'')+(pageToken?'&pageToken='+encodeURIComponent(pageToken):'');
+  const r=await driveFetch(url);const d=await r.json();all.push(...(d.files||[]));pageToken=d.nextPageToken||'';page++;incomplete=incomplete||!!d.incompleteSearch;
+  $('#driveStatus').textContent=`Reading Drive index · ${all.length} files`;
+  // Yield between pages so the UI remains responsive on large accounts.
+  await new Promise(resolve=>setTimeout(resolve,0));
  }while(pageToken);
+ if(incomplete)console.warn('Google Drive reported an incomplete search; some results may be missing.');
  return all;
 }
 async function getAudioHeader(f, length=65536){
  const r=await driveFetch('https://www.googleapis.com/drive/v3/files/'+encodeURIComponent(f.id)+'?alt=media',{headers:{Range:`bytes=0-${length-1}`}});
- return new Uint8Array(await r.arrayBuffer());
+ // Some servers/proxies ignore Range and answer 200 with the whole song. Read at most
+ // the header bytes and cancel the stream, rather than buffering a multi-GB file.
+ if(!r.body?.getReader)return new Uint8Array(0);
+ const reader=r.body.getReader(),chunks=[];let total=0;
+ try{
+  while(total<length){
+   const {done,value}=await reader.read();if(done)break;
+   const take=value.subarray(0,Math.min(value.length,length-total));
+   chunks.push(take);total+=take.length;
+   if(take.length<value.length||total>=length){await reader.cancel().catch(()=>{});break}
+  }
+ }finally{try{reader.releaseLock()}catch{}}
+ const out=new Uint8Array(total);let offset=0;for(const chunk of chunks){out.set(chunk,offset);offset+=chunk.length}
+ return out;
 }
 function parseWavDuration(bytes,fileSize){
  if(bytes.length<12||String.fromCharCode(...bytes.slice(0,4))!=='RIFF'||String.fromCharCode(...bytes.slice(8,12))!=='WAVE')return null;
@@ -204,41 +223,62 @@ function parseMp3Duration(bytes,fileSize){
  return null;
 }
 async function probeDuration(f,oldTrack){
- if(Number(oldTrack?.duration)>0)return Number(oldTrack.duration);
- const ext=fileExtension(f.name),mime=normalizedAudioMime(f);
+ // Reuse metadata only when the Drive file has not changed.
+ if(Number(oldTrack?.duration)>0&&oldTrack.modifiedTime===f.modifiedTime)return Number(oldTrack.duration);
+ const ext=fileExtension(f.name);
  try{
   if(['mp3','wav','wave'].includes(ext)){
    const bytes=await getAudioHeader(f,65536);
    const d=(ext==='wav'||ext==='wave')?parseWavDuration(bytes,Number(f.size||0)):parseMp3Duration(bytes,Number(f.size||0));
    if(Number.isFinite(d)&&d>0)return d;
   }
-  // For other audio containers, let the browser read metadata from a temporary object URL.
-  // This fallback downloads the file only when its duration cannot be inferred from a header.
-  const r=await driveFetch('https://www.googleapis.com/drive/v3/files/'+encodeURIComponent(f.id)+'?alt=media');
-  const blob=await r.blob();const url=URL.createObjectURL(new Blob([blob],{type:mime}));
-  try{return await new Promise(resolve=>{const a=new Audio();let settled=false;const finish=v=>{if(settled)return;settled=true;a.removeAttribute('src');a.load();URL.revokeObjectURL(url);resolve(Number.isFinite(v)&&v>0?v:null)};a.preload='metadata';a.onloadedmetadata=()=>finish(a.duration);a.onerror=()=>finish(null);a.src=url;setTimeout(()=>finish(null),15000)})}finally{}
+  // Never download entire songs just to inspect duration during a library scan:
+  // on libraries with thousands of files this can exhaust memory and crash mobile browsers.
+  // Other formats are accepted only when a trustworthy cached duration exists.
+  return null;
  }catch(e){console.warn('Could not inspect audio duration:',f.name,e);return null}
- return null;
 }
 async function qualifyAudioFiles(files, oldMap, statusLabel='Scanning Drive'){
  const candidates=files.filter(f=>isAudioCandidate(f)&&f.mimeType!=='application/vnd.google-apps.shortcut');
- const accepted=[],stats={scanned:candidates.length,short:0,unknown:0};let cursor=0,done=0;
- async function worker(){while(true){const i=cursor++;if(i>=candidates.length)return;const f=candidates[i],old=oldMap.get(f.id);let d=await probeDuration(f,old);done++;
-  if(d!==null&&d>30){accepted.push({...old,id:f.id,name:f.name.replace(/\.[^.]+$/,''),fileName:f.name,mimeType:normalizedAudioMime(f),driveMimeType:f.mimeType,size:Number(f.size||0),modifiedTime:f.modifiedTime,description:f.description||'',source:'Google Drive',webViewLink:f.webViewLink,parents:f.parents||[],duration:d})}
-  else if(d!==null)stats.short++;else stats.unknown++;
-  if(done%5===0||done===candidates.length)$('#driveStatus').textContent=`${statusLabel} · checked ${done}/${candidates.length}`;
- }}
- await Promise.all(Array.from({length:Math.min(4,candidates.length)},worker));accepted.sort((a,b)=>a.fileName.localeCompare(b.fileName,undefined,{sensitivity:'base'}));return {accepted,stats};
+ const accepted=[],stats={scanned:candidates.length,short:0,unknown:0};let done=0;
+ // Small bounded batches avoid thousands of queued promises and keep mobile Safari responsive.
+ const concurrency=3,batchSize=60;
+ for(let start=0;start<candidates.length;start+=batchSize){
+  const batch=candidates.slice(start,start+batchSize);let cursor=0;
+  async function worker(){
+   while(true){
+    const i=cursor++;if(i>=batch.length)return;
+    const f=batch[i],old=oldMap.get(f.id);let d=await probeDuration(f,old);done++;
+    if(d!==null&&d>30){accepted.push({...old,id:f.id,name:f.name.replace(/\.[^.]+$/,''),fileName:f.name,mimeType:normalizedAudioMime(f),driveMimeType:f.mimeType,size:Number(f.size||0),modifiedTime:f.modifiedTime,description:f.description||'',source:'Google Drive',webViewLink:f.webViewLink,parents:f.parents||[],duration:d})}
+    else if(d!==null)stats.short++;else stats.unknown++;
+    if(done%10===0||done===candidates.length)$('#driveStatus').textContent=`${statusLabel} · ${done}/${candidates.length}`;
+   }
+  }
+  await Promise.all(Array.from({length:Math.min(concurrency,batch.length)},worker));
+  // Persist progress between batches, but do not sync the cloud DB 4,600 times.
+  save();
+  await new Promise(resolve=>setTimeout(resolve,0));
+ }
+ accepted.sort((a,b)=>a.fileName.localeCompare(b.fileName,undefined,{sensitivity:'base'}));return {accepted,stats};
 }
 async function importDriveFiles(){
  try{
-  $('#driveStatus').textContent='Scanning all Drive files…';
+  $('#driveStatus').textContent='Scanning Drive index…';
   const files=await listDriveFiles("trashed=false");
   const old=new Map(db.tracks.map(t=>[t.id,t]));
   const {accepted,stats}=await qualifyAudioFiles(files,old,'Checking audio');
+  // Keep the old library entries that could not be re-measured (e.g. FLAC/M4A) if
+  // they already have a valid duration and are still present in Drive.
+  const acceptedIds=new Set(accepted.map(t=>t.id)),fileById=new Map(files.map(f=>[f.id,f]));
+  for(const t of db.tracks){
+   const f=fileById.get(t.id);
+   if(f&&!acceptedIds.has(t.id)&&Number(t.duration)>30&&t.modifiedTime===f.modifiedTime&&isAudioCandidate(f)){
+    accepted.push({...t,parents:f.parents||t.parents||[],webViewLink:f.webViewLink||t.webViewLink});
+   }
+  }
   db.tracks=accepted;save();$('#driveStatus').textContent=`Connected · ${accepted.length} tracks (>30s)`;render();await saveCloudDb();
-  const note=`Imported ${accepted.length} tracks longer than 30 seconds.\nSkipped ${stats.short} tracks that are 30 seconds or shorter.`+(stats.unknown?`\nCould not read duration for ${stats.unknown} file(s); these were not added.`:'');
-  if(stats.unknown)alert(note);
+  const note=`Scanned ${files.length} Drive files; checked ${stats.scanned} audio candidates.\nImported/retained ${accepted.length} tracks longer than 30 seconds.\nSkipped ${stats.short} tracks that are 30 seconds or shorter.`+(stats.unknown?`\n${stats.unknown} files had unknown duration and were not downloaded in full, to prevent crashes. Existing tracks with saved duration were retained.`:'');
+  alert(note);
  }catch(e){console.error('Drive import failed',e);alert('Could not import files: '+e.message);$('#driveStatus').textContent='Connection issue'}
 }
 function openCreate(kind){let title=kind==='playlist'?'Create playlist':kind==='folder'?'Pack a Drive folder':'Create album';let extra='';if(kind==='album')extra=`<div class="field"><label>Build album from</label><select id="albumSource" onchange="toggleAlbumSource(this.value)"><option value="playlist">Regular playlist</option><option value="folder">Folder playlist</option></select></div><div class="field"><label>Source collection</label><select id="sourceId">${db.playlists.map(x=>`<option value="${x.id}">${escapeHtml(x.name)}</option>`).join('')||'<option value="">No playlists yet</option>'}</select><div id="sourceHelp" class="track-meta">The album starts with the playlist tracks. You can edit it later.</div></div>`;if(kind==='folder')extra=`<div class="field"><label>Find a Drive folder</label><input id="folderSearch" class="folder-search" type="search" placeholder="Search folders by name or path…" oninput="renderFolderTree(this.value)"><select id="folderId" class="hidden"><option value="">Choose a folder from Drive…</option></select><div class="folder-picker"><div class="folder-picker-head"><strong id="folderCount">Loading folders…</strong><span id="folderSelectedLabel">No folder selected</span></div><div id="folderTree" class="folder-tree"><div class="folder-empty">Connect Google Drive to browse folders.</div></div></div><div class="track-meta" style="margin-top:8px">Browse the folder tree to see which folders are inside other folders, or search by folder name. Select a folder to use it for this playlist.</div></div>`;openModal(`<h2>${title}</h2><div class="field"><label>Name</label><input id="collectionName" placeholder="${kind==='album'?'e.g. Blue hour':kind==='folder'?'e.g. Late night folder':'e.g. On repeat'}"></div><div class="field"><label>Description (optional)</label><input id="collectionDesc" placeholder="A little note about this collection"></div>${extra}<div class="modal-actions"><button class="ghost" onclick="closeModal()">Cancel</button><button class="primary" onclick="createCollection('${kind}')">Create</button></div>`);if(kind==='album')toggleAlbumSource('playlist');if(kind==='folder')loadFolders()}
